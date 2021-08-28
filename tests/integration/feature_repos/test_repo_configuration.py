@@ -1,16 +1,17 @@
 import tempfile
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
+from enum import IntEnum
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
+import pandas as pd
 import pytest
 
 from feast import FeatureStore, FeatureView, RepoConfig, driver_test_data, importer
 from feast.data_source import DataSource
-from tests.data.data_creator import create_dataset
 from tests.integration.feature_repos.universal.data_source_creator import (
     DataSourceCreator,
 )
@@ -34,6 +35,7 @@ class TestRepoConfig:
 
     full_feature_names: bool = True
     infer_event_timestamp_col: bool = True
+    infer_features: bool = False
 
 
 def ds_creator_path(cls: str):
@@ -71,9 +73,112 @@ FULL_REPO_CONFIGS: List[TestRepoConfig] = [
 ]
 
 
-OFFLINE_STORES: List[str] = []
-ONLINE_STORES: List[str] = []
-PROVIDERS: List[str] = []
+def construct_universal_entities() -> Dict[str, List[Any]]:
+    return {"customer": list(range(1001, 1110)), "driver": list(range(5001, 5110))}
+
+
+def construct_universal_datasets(
+    entities: Dict[str, List[Any]], start_time: datetime, end_time: datetime
+) -> Dict[str, pd.DataFrame]:
+    customer_df = driver_test_data.create_customer_daily_profile_df(
+        entities["customer"], start_time, end_time
+    )
+    driver_df = driver_test_data.create_driver_hourly_stats_df(
+        entities["driver"], start_time, end_time
+    )
+    orders_df = driver_test_data.create_orders_df(
+        customers=entities["customer"],
+        drivers=entities["driver"],
+        start_date=end_time - timedelta(days=365),
+        end_date=end_time + timedelta(days=365),
+        order_count=1000,
+    )
+
+    return {"customer": customer_df, "driver": driver_df, "orders": orders_df}
+
+
+def construct_universal_data_sources(
+    datasets: Dict[str, pd.DataFrame], data_source_creator: DataSourceCreator
+) -> Dict[str, DataSource]:
+    customer_ds = data_source_creator.create_data_source(
+        datasets["customer"],
+        destination="customer_profile",
+        event_timestamp_column="event_timestamp",
+        created_timestamp_column="created",
+    )
+    driver_ds = data_source_creator.create_data_source(
+        datasets["driver"],
+        destination="driver_hourly",
+        event_timestamp_column="event_timestamp",
+        created_timestamp_column="created",
+    )
+    orders_ds = data_source_creator.create_data_source(
+        datasets["orders"],
+        destination="orders",
+        event_timestamp_column="event_timestamp",
+        created_timestamp_column="created",
+    )
+    return {"customer": customer_ds, "driver": driver_ds, "orders": orders_ds}
+
+
+def construct_universal_feature_views(
+    data_sources: Dict[str, DataSource]
+) -> Dict[str, FeatureView]:
+    return {
+        "customer": create_customer_daily_profile_feature_view(
+            data_sources["customer"]
+        ),
+        "driver": create_driver_hourly_stats_feature_view(data_sources["driver"]),
+    }
+
+
+def setup_entities(
+    environment: "Environment", entities_override: Optional[Dict[str, List[Any]]] = None
+) -> "Environment":
+    environment.entities = (
+        entities_override if entities_override else construct_universal_entities()
+    )
+    return environment
+
+
+def setup_datasets(
+    environment: "Environment",
+    datasets_override: Optional[Dict[str, pd.DataFrame]] = None,
+) -> "Environment":
+    environment.datasets = (
+        datasets_override
+        if datasets_override
+        else construct_universal_datasets(
+            environment.entities, environment.start_date, environment.end_date
+        )
+    )
+    return environment
+
+
+def setup_data_sources(
+    environment: "Environment",
+    data_sources_override: Optional[Dict[str, DataSource]] = None,
+) -> "Environment":
+    environment.datasources = (
+        data_sources_override
+        if data_sources_override
+        else construct_universal_data_sources(
+            environment.datasets, environment.data_source_creator
+        )
+    )
+    return environment
+
+
+def setup_feature_views(
+    environment: "Environment",
+    feature_views_override: Optional[Dict[str, FeatureView]] = None,
+) -> "Environment":
+    environment.feature_views = (
+        feature_views_override
+        if feature_views_override
+        else construct_universal_feature_views(environment.datasources)
+    )
+    return environment
 
 
 @dataclass
@@ -81,81 +186,27 @@ class Environment:
     name: str
     test_repo_config: TestRepoConfig
     feature_store: FeatureStore
-    data_source: DataSource
     data_source_creator: DataSourceCreator
 
-    end_date = datetime.now().replace(microsecond=0, second=0, minute=0)
-    start_date = end_date - timedelta(days=7)
-    before_start_date = end_date - timedelta(days=365)
-    after_end_date = end_date + timedelta(days=365)
+    entities: Dict[str, List[Any]] = field(default_factory=dict)
+    datasets: Dict[str, pd.DataFrame] = field(default_factory=dict)
+    datasources: Dict[str, DataSource] = field(default_factory=dict)
+    feature_views: Dict[str, FeatureView] = field(default_factory=list)
 
-    customer_entities = list(range(1001, 1110))
-    customer_df = driver_test_data.create_customer_daily_profile_df(
-        customer_entities, start_date, end_date
+    end_date: datetime = field(
+        default=datetime.now().replace(microsecond=0, second=0, minute=0)
     )
-    _customer_feature_view: Optional[FeatureView] = None
 
-    driver_entities = list(range(5001, 5110))
-    driver_df = driver_test_data.create_driver_hourly_stats_df(
-        driver_entities, start_date, end_date
-    )
-    _driver_stats_feature_view: Optional[FeatureView] = None
+    def __post_init__(self):
+        self.start_date: datetime = self.end_date - timedelta(days=7)
 
-    orders_df = driver_test_data.create_orders_df(
-        customers=customer_entities,
-        drivers=driver_entities,
-        start_date=before_start_date,
-        end_date=after_end_date,
-        order_count=1000,
-    )
-    _orders_table: Optional[str] = None
 
-    def customer_feature_view(self) -> FeatureView:
-        if self._customer_feature_view is None:
-            customer_table_id = self.data_source_creator.get_prefixed_table_name(
-                self.name, "customer_profile"
-            )
-            ds = self.data_source_creator.create_data_source(
-                customer_table_id,
-                self.customer_df,
-                event_timestamp_column="event_timestamp",
-                created_timestamp_column="created",
-            )
-            self._customer_feature_view = create_customer_daily_profile_feature_view(ds)
-        return self._customer_feature_view
-
-    def driver_stats_feature_view(self) -> FeatureView:
-        if self._driver_stats_feature_view is None:
-            driver_table_id = self.data_source_creator.get_prefixed_table_name(
-                self.name, "driver_hourly"
-            )
-            ds = self.data_source_creator.create_data_source(
-                driver_table_id,
-                self.driver_df,
-                event_timestamp_column="event_timestamp",
-                created_timestamp_column="created",
-            )
-            self._driver_stats_feature_view = create_driver_hourly_stats_feature_view(
-                ds
-            )
-        return self._driver_stats_feature_view
-
-    def orders_table(self) -> Optional[str]:
-        if self._orders_table is None:
-            orders_table_id = self.data_source_creator.get_prefixed_table_name(
-                self.name, "orders"
-            )
-            ds = self.data_source_creator.create_data_source(
-                orders_table_id,
-                self.orders_df,
-                event_timestamp_column="event_timestamp",
-                created_timestamp_column="created",
-            )
-            if hasattr(ds, "table_ref"):
-                self._orders_table = ds.table_ref
-            elif hasattr(ds, "table"):
-                self._orders_table = ds.table
-        return self._orders_table
+def table_name_from_data_source(ds: DataSource) -> Optional[str]:
+    if hasattr(ds, "table_ref"):
+        return ds.table_ref
+    elif hasattr(ds, "table"):
+        return ds.table
+    return None
 
 
 def vary_full_feature_names(configs: List[TestRepoConfig]) -> List[TestRepoConfig]:
@@ -178,6 +229,15 @@ def vary_infer_event_timestamp_col(
     return new_configs
 
 
+def vary_infer_feature(configs: List[TestRepoConfig]) -> List[TestRepoConfig]:
+    new_configs = []
+    for c in configs:
+        true_c = replace(c, infer_features=True)
+        false_c = replace(c, infer_features=False)
+        new_configs.extend([true_c, false_c])
+    return new_configs
+
+
 def vary_providers_for_offline_stores(
     configs: List[TestRepoConfig],
 ) -> List[TestRepoConfig]:
@@ -194,25 +254,21 @@ def vary_providers_for_offline_stores(
     return new_configs
 
 
+class EnvironmentSetupSteps(IntEnum):
+    INIT = 0
+    CREATE_OBJECTS = 1
+    APPLY_OBJECTS = 2
+    MATERIALIZE = 3
+
+
+DEFAULT_STEP = EnvironmentSetupSteps.INIT
+
+
 @contextmanager
 def construct_test_environment(
-    test_repo_config: TestRepoConfig,
-    create_and_apply: bool = False,
-    materialize: bool = False,
+    test_suite_name: str, test_repo_config: TestRepoConfig,
 ) -> Environment:
-    """
-    This method should take in the parameters from the test repo config and created a feature repo, apply it,
-    and return the constructed feature store object to callers.
-
-    This feature store object can be interacted for the purposes of tests.
-    The user is *not* expected to perform any clean up actions.
-
-    :param test_repo_config: configuration
-    :return: A feature store built using the supplied configuration.
-    """
-    df = create_dataset()
-
-    project = f"test_correctness_{str(uuid.uuid4()).replace('-', '')[:8]}"
+    project = f"{test_suite_name}_{str(uuid.uuid4()).replace('-', '')[:8]}"
 
     module_name, config_class_name = test_repo_config.offline_store_creator.rsplit(
         ".", 1
@@ -221,10 +277,8 @@ def construct_test_environment(
     offline_creator: DataSourceCreator = importer.get_class_from_type(
         module_name, config_class_name, "DataSourceCreator"
     )(project)
-    ds = offline_creator.create_data_source(
-        project, df, field_mapping={"ts_1": "ts", "id": "driver_id"}
-    )
-    offline_store = offline_creator.create_offline_store_config()
+
+    offline_store_config = offline_creator.create_offline_store_config()
     online_store = test_repo_config.online_store
 
     with tempfile.TemporaryDirectory() as repo_dir_name:
@@ -232,7 +286,7 @@ def construct_test_environment(
             registry=str(Path(repo_dir_name) / "registry.db"),
             project=project,
             provider=test_repo_config.provider,
-            offline_store=offline_store,
+            offline_store=offline_store_config,
             online_store=online_store,
             repo_path=repo_dir_name,
         )
@@ -241,52 +295,85 @@ def construct_test_environment(
             name=project,
             test_repo_config=test_repo_config,
             feature_store=fs,
-            data_source=ds,
             data_source_creator=offline_creator,
         )
 
+        try:
+            yield environment
+        finally:
+            fs.teardown()
+
+
+@contextmanager
+def construct_universal_test_environment(
+    test_suite_name: str,
+    test_repo_config: TestRepoConfig,
+    stop_at_step=DEFAULT_STEP,
+    data_source_cache=None,
+) -> Environment:
+    """
+    This method should take in the parameters from the test repo config and created a feature repo, apply it,
+    and return the constructed feature store object to callers.
+
+    This feature store object can be interacted for the purposes of tests.
+    The user is *not* expected to perform any clean up actions.
+
+    :param test_suite_name: A name for the test suite.
+    :param test_repo_config: configuration
+    :param stop_at_step: The step which should be the last one executed when setting up the test environment.
+    :param data_source_cache:
+    :return: A feature store built using the supplied configuration.
+    """
+    with construct_test_environment(test_suite_name, test_repo_config) as environment:
+        fs = environment.feature_store
         fvs = []
         entities = []
         try:
-            if create_and_apply:
-                entities.extend([driver(), customer()])
-                fvs.extend(
-                    [
-                        environment.driver_stats_feature_view(),
-                        environment.customer_feature_view(),
-                    ]
-                )
-                fs.apply(fvs + entities)
+            if stop_at_step >= EnvironmentSetupSteps.CREATE_OBJECTS:
+                if data_source_cache is not None:
+                    fixtures = data_source_cache.get(
+                        test_repo_config.offline_store_creator, None
+                    )
+                    if fixtures:
+                        environment = setup_entities(
+                            environment, entities_override=fixtures[0]
+                        )
+                        environment = setup_datasets(
+                            environment, datasets_override=fixtures[1]
+                        )
+                        environment = setup_data_sources(
+                            environment, data_sources_override=fixtures[2]
+                        )
+                    else:
+                        environment = setup_entities(environment)
+                        environment = setup_datasets(environment)
+                        environment = setup_data_sources(environment)
+                        data_source_cache[test_repo_config.offline_store_creator] = (
+                            environment.entities,
+                            environment.datasets,
+                            environment.datasources,
+                            environment.data_source_creator,
+                        )
+                else:
+                    environment = setup_entities(environment)
+                    environment = setup_datasets(environment)
+                    environment = setup_data_sources(environment)
 
-            if materialize:
+                environment = setup_feature_views(environment)
+            if stop_at_step >= EnvironmentSetupSteps.APPLY_OBJECTS:
+                entities.extend([driver(), customer()])
+                fvs.extend(environment.feature_views.values())
+                fs.apply(fvs + entities)
+            if stop_at_step >= EnvironmentSetupSteps.MATERIALIZE:
                 fs.materialize(environment.start_date, environment.end_date)
 
             yield environment
         finally:
-            offline_creator.teardown()
-            fs.teardown()
-
-
-def parametrize_e2e_test(e2e_test):
-    """
-    This decorator should be used for end-to-end tests. These tests are expected to be parameterized,
-    and receive an empty feature repo created for all supported configurations.
-
-    The decorator also ensures that sample data needed for the test is available in the relevant offline store.
-
-    Decorated tests should create and apply the objects needed by the tests, and perform any operations needed
-    (such as materialization and looking up feature values).
-
-    The decorator takes care of tearing down the feature store, as well as the sample data.
-    """
-
-    @pytest.mark.integration
-    @pytest.mark.parametrize("config", FULL_REPO_CONFIGS, ids=lambda v: str(v))
-    def inner_test(config):
-        with construct_test_environment(config) as environment:
-            e2e_test(environment)
-
-    return inner_test
+            if (
+                data_source_cache is None
+                and stop_at_step >= EnvironmentSetupSteps.CREATE_OBJECTS
+            ):
+                environment.data_source_creator.teardown()
 
 
 def parametrize_offline_retrieval_test(offline_retrieval_test):
@@ -303,14 +390,17 @@ def parametrize_offline_retrieval_test(offline_retrieval_test):
     The decorator takes care of tearing down the feature store, as well as the sample data.
     """
 
-    configs = vary_providers_for_offline_stores(FULL_REPO_CONFIGS)
-    configs = vary_full_feature_names(configs)
-    configs = vary_infer_event_timestamp_col(configs)
+    configs = vary_full_feature_names(FULL_REPO_CONFIGS)
 
     @pytest.mark.integration
     @pytest.mark.parametrize("config", configs, ids=lambda v: str(v))
-    def inner_test(config):
-        with construct_test_environment(config, create_and_apply=True) as environment:
+    def inner_test(config, universal_data_source_cache):
+        with construct_universal_test_environment(
+            offline_retrieval_test.__name__,
+            config,
+            stop_at_step=EnvironmentSetupSteps.APPLY_OBJECTS,
+            data_source_cache=universal_data_source_cache,
+        ) as environment:
             offline_retrieval_test(environment)
 
     return inner_test
@@ -328,15 +418,16 @@ def parametrize_online_test(online_test):
     The decorator takes care of tearing down the feature store, as well as the sample data.
     """
 
-    configs = vary_providers_for_offline_stores(FULL_REPO_CONFIGS)
-    configs = vary_full_feature_names(configs)
-    configs = vary_infer_event_timestamp_col(configs)
+    configs = vary_full_feature_names(FULL_REPO_CONFIGS)
 
     @pytest.mark.integration
     @pytest.mark.parametrize("config", configs, ids=lambda v: str(v))
-    def inner_test(config):
-        with construct_test_environment(
-            config, create_and_apply=True, materialize=True
+    def inner_test(config, universal_data_source_cache):
+        with construct_universal_test_environment(
+            online_test.__name__,
+            config,
+            stop_at_step=EnvironmentSetupSteps.MATERIALIZE,
+            data_source_cache=universal_data_source_cache,
         ) as environment:
             online_test(environment)
 

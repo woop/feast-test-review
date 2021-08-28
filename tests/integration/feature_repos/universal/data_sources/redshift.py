@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Dict, Optional
 
 import pandas as pd
 
@@ -33,12 +33,15 @@ class RedshiftDataSourceCreator(DataSourceCreator):
 
     def create_data_source(
         self,
-        destination: str,
         df: pd.DataFrame,
+        destination: str,
+        suffix: Optional[str] = None,
         event_timestamp_column="ts",
         created_timestamp_column="created_ts",
         field_mapping: Dict[str, str] = None,
     ) -> DataSource:
+
+        destination = self.get_prefixed_table_name(destination)
 
         aws_utils.upload_df_to_redshift(
             self.client,
@@ -65,8 +68,8 @@ class RedshiftDataSourceCreator(DataSourceCreator):
     def create_offline_store_config(self) -> FeastConfigBaseModel:
         return self.offline_store_config
 
-    def get_prefixed_table_name(self, name: str, suffix: str) -> str:
-        return f"{name}_{suffix}"
+    def get_prefixed_table_name(self, suffix: str) -> str:
+        return f"{self.project_name}_{suffix}"
 
     def teardown(self):
         for table in self.tables:
